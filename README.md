@@ -17,7 +17,7 @@ the model guessing.
 ## Run it
 
 ```bash
-pip install pytest pytest-cov pytest-json-report anthropic
+pip install pytest pytest-cov anthropic
 export ANTHROPIC_API_KEY=sk-...
 python -m testloop example_target.py --coverage 90 --max-iters 5
 ```
