@@ -1,2 +1,6 @@
 .venv
 billing.py
+/test_*.py
+.testloop/
+__pycache__/
+*.egg-info/
