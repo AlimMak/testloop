@@ -64,6 +64,7 @@ def generate_tests(
     coverage_target: float = 80.0,
     max_iterations: int = 5,
     timeout: int = 60,
+    use_docker: bool = False,
     on_event=lambda *_: None,
 ) -> LoopResult:
     tests = ""
@@ -92,7 +93,7 @@ def generate_tests(
             )
             bug_reason, tests = _extract_bug(raw)
 
-        result = run_tests(source, tests, timeout=timeout)
+        result = run_tests(source, tests, timeout=timeout, use_docker=use_docker)
         on_event(
             "observe", i,
             f"{result.passed} passed, {result.failed} failed, "

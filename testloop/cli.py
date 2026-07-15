@@ -31,6 +31,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-o", "--out", default=None,
                    help="where to write tests (default test_<name>.py)")
     p.add_argument("--model", default="claude-sonnet-5")
+    p.add_argument("--docker", action="store_true",
+                   help="run generated tests in an isolated container "
+                        "(no network, capped memory/pids)")
     p.add_argument("--mock", action="store_true",
                    help="run without the API using scripted responses")
     args = p.parse_args(argv)
@@ -44,14 +47,16 @@ def main(argv: list[str] | None = None) -> int:
 
     out = args.out or f"test_{os.path.basename(args.target)}"
 
+    sandbox = "docker" if args.docker else "local subprocess"
     print(f"testloop: {args.target}  (target {args.coverage}% cov, "
-          f"max {args.max_iters} iters)")
+          f"max {args.max_iters} iters, sandbox: {sandbox})")
     llm = LLM(mock=args.mock, model=args.model)
     loop = generate_tests(
         source, llm,
         coverage_target=args.coverage,
         max_iterations=args.max_iters,
         timeout=args.timeout,
+        use_docker=args.docker,
         on_event=_print_event,
     )
 

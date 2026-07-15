@@ -39,18 +39,39 @@ python -m testloop example_target.py --mock
 - `prompts.py` holds the generate and repair prompts (the main tuning surface).
 - `cli.py` is the entry point.
 
-## The sandbox boundary (say this in interviews)
+## Sandboxing
 
-Running model-generated code is a real risk. v0 uses process isolation plus a
-timeout: a fresh working directory, a subprocess that can be killed, and a wall
-clock limit that kills infinite loops. That contains accidents and runaway
-loops but does not stop deliberately malicious code, since it still runs on the
-host interpreter. The hardening path is a Docker sandbox with no network and a
-read-only mount. Knowing exactly where your isolation stops is the point.
+Running model-generated code is the real risk in a tool like this, so isolation
+is a first-class feature rather than an afterthought.
+
+**local (default)** — a fresh temp dir plus a subprocess with a hard timeout.
+That contains accidents and kills infinite loops, but the code still runs on the
+host interpreter with your permissions. Fine for code you trust.
+
+**docker (`--docker`)** — the same tests run in a throwaway container:
+
+- `--network=none` so generated code cannot phone home or pull anything
+- `--memory=512m` and `--pids-limit=128` so it cannot exhaust or fork-bomb the host
+- the only host path it can see is one throwaway temp dir mounted at `/work`
+- the container is named, so a timeout kills it by name; a runaway test cannot
+  outlive the run
+- `--rm` so nothing is left behind
+
+Build the image once:
+
+```bash
+docker build -t testloop-sandbox .
+python -m testloop billing.py --docker --coverage 95
+```
+
+Where it still stops: the container runs as root and shares the host kernel, so
+this is isolation against runaway and misbehaving code, not against a determined
+attacker with a kernel exploit. Knowing exactly where your isolation ends is the
+point.
 
 ## Roadmap / stretch
 
-- Docker sandbox (network off, read-only source mount)
+- Non-root container user and a read-only source mount
 - Coverage-guided repair that targets specific uncovered branches, not just lines
 - Distinguish "the test is wrong" from "the source has a bug" and surface both
 - Multi-file / whole-repo mode
