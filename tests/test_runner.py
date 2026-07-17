@@ -195,3 +195,32 @@ def test_collect_output_is_tail_of_input(tmp_path):
 def test_all_passed_property(kwargs, expected):
     result = RunResult(**kwargs)
     assert result.all_passed is expected
+
+
+# ─── RunResult.collection_error property ─────────────────────────────────────
+
+@pytest.mark.parametrize("kwargs, expected", [
+    pytest.param(
+        dict(collected=False, timed_out=False),
+        True,
+        id="not_collected_no_timeout",
+    ),
+    pytest.param(
+        dict(collected=False, timed_out=True),
+        False,
+        id="timeout_is_not_collection_error",
+    ),
+    pytest.param(
+        dict(collected=True, timed_out=False),
+        False,
+        id="collected_ok",
+    ),
+    pytest.param(
+        dict(collected=True, timed_out=True),
+        False,
+        id="collected_and_timed_out",
+    ),
+])
+def test_collection_error_property(kwargs, expected):
+    result = RunResult(**kwargs)
+    assert result.collection_error is expected

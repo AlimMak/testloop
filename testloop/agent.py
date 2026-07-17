@@ -66,7 +66,37 @@ def generate_tests(
     timeout: int = 60,
     use_docker: bool = False,
     on_event=lambda *_: None,
+    module_dotted: str = "target",
+    package_files: dict[str, str] | None = None,
 ) -> LoopResult:
+    """Run the closed generate/repair loop for a single module.
+
+    Parameters
+    ----------
+    source:
+        The source code of the module under test (used in prompts).
+    llm:
+        LLM wrapper to use for generation and repair calls.
+    coverage_target:
+        Minimum coverage percentage required for a "success" outcome.
+    max_iterations:
+        Maximum number of generate/repair iterations before giving up.
+    timeout:
+        Per-run pytest timeout in seconds.
+    use_docker:
+        Run tests in an isolated Docker container.
+    on_event:
+        Callback ``(kind, iteration, message)`` for progress reporting.
+    module_dotted:
+        Importable dotted name of the module (e.g. ``"target"`` or
+        ``"mypkg.utils"``).  Passed to prompts so the model generates
+        correct import statements, and to the runner for coverage flags.
+    package_files:
+        When testing a module that is part of a package, pass the full
+        ``{relative_posix_path: source_text}`` mapping returned by
+        :func:`testloop.discovery.collect_package_files`.  ``None`` keeps the
+        original single-file behaviour.
+    """
     tests = ""
     result = RunResult()
 
@@ -75,17 +105,26 @@ def generate_tests(
         if i == 1:
             on_event("act", i, "generating initial tests")
             tests = llm.complete(
-                prompts.GENERATE_SYSTEM,
-                prompts.GENERATE_USER.format(source=source),
+                prompts.GENERATE_SYSTEM.format(module_dotted=module_dotted),
+                prompts.GENERATE_USER.format(source=source, module_dotted=module_dotted),
             )
         else:
             on_event("act", i, "repairing tests")
+            # When pytest could not collect any tests (e.g. ImportError in the
+            # test file), prepend an explicit label so the model knows no tests
+            # ran — it must fix the imports before worrying about assertions.
+            repair_output = (
+                "[COLLECTION ERROR — pytest could not import the test module. "
+                "No tests ran. The import statements are wrong; fix them first.]\n"
+                + result.output
+            ) if result.collection_error else result.output
             raw = llm.complete(
-                prompts.REPAIR_SYSTEM,
+                prompts.REPAIR_SYSTEM.format(module_dotted=module_dotted),
                 prompts.REPAIR_USER.format(
                     source=source,
+                    module_dotted=module_dotted,
                     tests=tests,
-                    output=result.output,
+                    output=repair_output,
                     coverage=result.coverage,
                     target=coverage_target,
                     uncovered=result.uncovered_lines,
@@ -93,12 +132,21 @@ def generate_tests(
             )
             bug_reason, tests = _extract_bug(raw)
 
-        result = run_tests(source, tests, timeout=timeout, use_docker=use_docker)
-        on_event(
-            "observe", i,
-            f"{result.passed} passed, {result.failed} failed, "
-            f"{result.coverage}% coverage",
+        result = run_tests(
+            source, tests,
+            timeout=timeout,
+            use_docker=use_docker,
+            module_dotted=module_dotted,
+            package_files=package_files,
         )
+        if result.collection_error:
+            on_event("observe", i, "collection error (no tests ran — import failed)")
+        else:
+            on_event(
+                "observe", i,
+                f"{result.passed} passed, {result.failed} failed, "
+                f"{result.coverage}% coverage",
+            )
 
         # A declared bug only counts if a test actually fails to confirm it.
         if bug_reason and not result.all_passed:

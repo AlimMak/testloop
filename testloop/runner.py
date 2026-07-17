@@ -33,6 +33,7 @@ import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from pathlib import Path
 
 SANDBOX_IMAGE = "testloop-sandbox"
 
@@ -52,13 +53,26 @@ class RunResult:
     def all_passed(self) -> bool:
         return self.collected and self.failed == 0 and self.errors == 0 and self.passed > 0
 
+    @property
+    def collection_error(self) -> bool:
+        """True when pytest failed to collect tests (import error, syntax error, etc.).
 
-PYTEST_ARGS = [
-    "test_target.py",
-    "--cov=target", "--cov-report=json",   # writes coverage.json into cwd
-    "--junit-xml=results.xml",             # built-in, no plugin needed
-    "-p", "no:cacheprovider", "-q",
-]
+        Distinct from a test *failure*: with a collection error no tests ran at
+        all.  The loop must not treat 0 passed / 0 failed as ordinary output —
+        the import statements in the test file are wrong and must be repaired
+        before any test logic can be evaluated.
+        """
+        return not self.collected and not self.timed_out
+
+
+def _pytest_args(module_dotted: str) -> list[str]:
+    """Return the pytest argument list for a given module coverage target."""
+    return [
+        "test_target.py",
+        f"--cov={module_dotted}", "--cov-report=json",  # writes coverage.json into cwd
+        "--junit-xml=results.xml",                       # built-in, no plugin needed
+        "-p", "no:cacheprovider", "-q",
+    ]
 
 
 def _parse_junit(path: str) -> tuple[int, int, int, bool]:
@@ -75,7 +89,7 @@ def _parse_junit(path: str) -> tuple[int, int, int, bool]:
     return tests - failures - errors - skipped, failures, errors, tests > 0
 
 
-def _collect(workdir: str, output: str) -> RunResult:
+def _collect(workdir: str, output: str, module_dotted: str = "target") -> RunResult:
     """Build a RunResult from the report files pytest left in workdir."""
     result = RunResult(output=output[-6000:])
 
@@ -96,37 +110,57 @@ def _collect(workdir: str, output: str) -> RunResult:
             cov = json.load(f)
         result.coverage = round(cov.get("totals", {}).get("percent_covered", 0.0), 1)
         files = cov.get("files", {})
-        tgt = files.get("target.py") or next(iter(files.values()), {})
+        # Build the relative POSIX path we expect as the coverage key.
+        # For single-file mode: "target" -> "target.py"
+        # For package mode:    "mypkg.utils" -> "mypkg/utils.py"
+        module_path = module_dotted.replace(".", "/") + ".py"
+        tgt = next(
+            (
+                v for k, v in files.items()
+                if k.replace("\\", "/") == module_path
+                or k.replace("\\", "/").endswith("/" + module_path)
+            ),
+            next(iter(files.values()), {}),
+        )
         result.uncovered_lines = tgt.get("missing_lines", [])
 
     return result
 
 
-def _run_local(workdir: str, timeout: int) -> RunResult:
-    cmd = [sys.executable, "-m", "pytest", *PYTEST_ARGS]
+def _run_local(workdir: str, timeout: int, module_dotted: str = "target") -> RunResult:
+    cmd = [sys.executable, "-m", "pytest", *_pytest_args(module_dotted)]
+    # Set PYTHONPATH to workdir so package-mode imports (e.g. `from mypkg.utils
+    # import helper`) work.  This is a no-op for single-file mode because pytest
+    # already prepends the test directory to sys.path.
+    env = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": workdir,
+    }
     try:
         proc = subprocess.run(
             cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            env=env,
         )
         output = proc.stdout + proc.stderr
     except subprocess.TimeoutExpired as e:
         return RunResult(output=(e.stdout or "") + f"\n[timed out after {timeout}s]",
                          timed_out=True, collected=False)
-    return _collect(workdir, output)
+    return _collect(workdir, output, module_dotted)
 
 
-def _run_docker(workdir: str, timeout: int) -> RunResult:
+def _run_docker(workdir: str, timeout: int, module_dotted: str = "target") -> RunResult:
     name = f"testloop_{uuid.uuid4().hex[:12]}"
     cmd = [
         "docker", "run", "--rm", "--name", name,
         "--network=none",        # generated code gets no internet
         "--memory=512m",         # cannot exhaust host RAM
         "--pids-limit=128",      # cannot fork-bomb the host
+        "-e", "PYTHONPATH=/work",
         "-v", f"{workdir}:/work",
         "-w", "/work",
         SANDBOX_IMAGE,
-        "python", "-m", "pytest", *PYTEST_ARGS,
+        "python", "-m", "pytest", *_pytest_args(module_dotted),
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -149,17 +183,44 @@ def _run_docker(workdir: str, timeout: int) -> RunResult:
                                     f"`docker build -t {SANDBOX_IMAGE} .`]",
             collected=False, errors=1,
         )
-    return _collect(workdir, output)
+    return _collect(workdir, output, module_dotted)
 
 
-def run_tests(source_code: str, test_code: str, timeout: int = 60,
-              use_docker: bool = False) -> RunResult:
+def run_tests(
+    source_code: str,
+    test_code: str,
+    timeout: int = 60,
+    use_docker: bool = False,
+    module_dotted: str = "target",
+    package_files: dict[str, str] | None = None,
+) -> RunResult:
+    """Execute *test_code* against *source_code* and return structured results.
+
+    Single-file mode (default, ``package_files=None``):
+        Writes ``target.py`` and ``test_target.py`` into a temp directory and
+        runs pytest there.  This is the original behaviour; existing callers
+        that omit *module_dotted* and *package_files* are unaffected.
+
+    Package mode (``package_files`` supplied):
+        Writes the full file tree from *package_files* (a ``{relative_posix_path:
+        source_text}`` mapping) into the temp directory, preserving the package
+        structure.  Generated tests must use the real dotted import path (e.g.
+        ``from mypkg.utils import helper``).  *source_code* is only used by the
+        prompt layer and need not be re-written here.
+    """
     workdir = tempfile.mkdtemp(prefix="testloop_")
     try:
-        with open(os.path.join(workdir, "target.py"), "w") as f:
-            f.write(source_code)
-        with open(os.path.join(workdir, "test_target.py"), "w") as f:
-            f.write(test_code)
-        return (_run_docker if use_docker else _run_local)(workdir, timeout)
+        if package_files is not None:
+            # Package mode: recreate the entire tree so package imports resolve.
+            for rel_posix, content in package_files.items():
+                dest = Path(workdir, rel_posix)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(content, encoding="utf-8")
+        else:
+            # Single-file mode: classic target.py alongside test_target.py.
+            Path(workdir, "target.py").write_text(source_code, encoding="utf-8")
+        Path(workdir, "test_target.py").write_text(test_code, encoding="utf-8")
+        runner = _run_docker if use_docker else _run_local
+        return runner(workdir, timeout, module_dotted)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

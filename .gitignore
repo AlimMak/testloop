@@ -4,3 +4,4 @@ billing.py
 .testloop/
 __pycache__/
 *.egg-info/
+scratch/

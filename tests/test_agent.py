@@ -112,6 +112,57 @@ def test_bug_marker_ignored_when_confirming_test_passes():
     assert loop.bug_reason is None
 
 
+# ─── Collection error handling ────────────────────────────────────────────────
+
+# A RunResult where pytest failed before any tests were collected.
+COLLECTION_ERR = RunResult(passed=0, failed=0, errors=1, collected=False, timed_out=False)
+
+
+def test_collection_error_observe_message():
+    """Collection-error observe event says 'collection error', not '0 passed ...'."""
+    events: list[tuple[str, str]] = []
+    llm = _llm([STUB_TESTS, STUB_TESTS])
+    with patch("testloop.agent.run_tests", side_effect=[COLLECTION_ERR, PASSING]):
+        generate_tests(
+            SOURCE, llm,
+            coverage_target=80.0, max_iterations=5,
+            on_event=lambda kind, i, msg: events.append((kind, msg)),
+        )
+    first_observe = next(msg for kind, msg in events if kind == "observe")
+    assert "collection error" in first_observe
+    # The normal observe format is "N passed, N failed, N% coverage".
+    # A collection error must not produce that format.
+    assert "passed," not in first_observe  # "passed," only appears in the count format
+    assert "coverage" not in first_observe
+
+
+def test_collection_error_loop_continues():
+    """A collection error alone must not end the loop; the next iteration can succeed."""
+    llm = _llm([STUB_TESTS, STUB_TESTS])
+    with patch("testloop.agent.run_tests", side_effect=[COLLECTION_ERR, PASSING]):
+        loop = generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=5)
+    assert loop.outcome == "success"
+    assert loop.iterations == 2
+
+
+def test_collection_error_prefix_in_repair_prompt():
+    """[COLLECTION ERROR ...] prefix is injected into the repair user prompt."""
+    captured: list[str] = []
+
+    def spy_complete(system: str, user: str) -> str:
+        captured.append(user)
+        return STUB_TESTS
+
+    llm = _llm([STUB_TESTS])  # prevents _DEMO seeding; actual calls go to spy_complete
+    with patch("testloop.agent.run_tests", side_effect=[COLLECTION_ERR, PASSING]):
+        with patch.object(llm, "complete", side_effect=spy_complete):
+            generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=5)
+
+    # captured[0] = generate prompt (iteration 1), captured[1] = repair prompt (iteration 2)
+    assert len(captured) >= 2
+    assert "[COLLECTION ERROR" in captured[1]
+
+
 # ─── Outcome: incomplete ──────────────────────────────────────────────────────
 
 def test_incomplete_when_max_iterations_exhausted():
