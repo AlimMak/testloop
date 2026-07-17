@@ -163,6 +163,39 @@ def test_collection_error_prefix_in_repair_prompt():
     assert "[COLLECTION ERROR" in captured[1]
 
 
+def test_repair_system_prompt_contains_dotted_module_name():
+    """REPAIR_SYSTEM sent to the LLM must contain the full dotted module name."""
+    captured_systems: list[str] = []
+
+    def spy_complete(system: str, user: str) -> str:
+        captured_systems.append(system)
+        return STUB_TESTS
+
+    llm = _llm([STUB_TESTS])
+    with patch("testloop.agent.run_tests", side_effect=[FAILING, PASSING]):
+        with patch.object(llm, "complete", side_effect=spy_complete):
+            generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=5,
+                           module_dotted="mypkg.billing")
+
+    # captured_systems[0] = generate system, captured_systems[1] = repair system
+    assert len(captured_systems) >= 2
+    assert "mypkg.billing" in captured_systems[1]
+
+
+def test_bug_found_not_triggered_on_collection_error():
+    """A SOURCE_BUG marker returned during a collection-error run must not yield bug_found.
+
+    No test assertions ran — the import was broken — so the loop cannot conclude
+    that the source is buggy.  It must keep repairing instead.
+    """
+    bug_reply = f"TESTLOOP_SOURCE_BUG: source is broken\n{STUB_TESTS}"
+    llm = _llm([STUB_TESTS, bug_reply])
+    # Every run returns a collection error: the marker can never be confirmed.
+    with patch("testloop.agent.run_tests", return_value=COLLECTION_ERR):
+        loop = generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=3)
+    assert loop.outcome != "bug_found"
+
+
 # ─── Outcome: incomplete ──────────────────────────────────────────────────────
 
 def test_incomplete_when_max_iterations_exhausted():

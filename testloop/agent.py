@@ -102,10 +102,11 @@ def generate_tests(
 
     for i in range(1, max_iterations + 1):
         bug_reason = None
+        import_contract = prompts._import_contract(module_dotted)
         if i == 1:
             on_event("act", i, "generating initial tests")
             tests = llm.complete(
-                prompts.GENERATE_SYSTEM.format(module_dotted=module_dotted),
+                prompts.GENERATE_SYSTEM.format(import_contract=import_contract),
                 prompts.GENERATE_USER.format(source=source, module_dotted=module_dotted),
             )
         else:
@@ -119,7 +120,7 @@ def generate_tests(
                 + result.output
             ) if result.collection_error else result.output
             raw = llm.complete(
-                prompts.REPAIR_SYSTEM.format(module_dotted=module_dotted),
+                prompts.REPAIR_SYSTEM.format(import_contract=import_contract),
                 prompts.REPAIR_USER.format(
                     source=source,
                     module_dotted=module_dotted,
@@ -148,8 +149,11 @@ def generate_tests(
                 f"{result.coverage}% coverage",
             )
 
-        # A declared bug only counts if a test actually fails to confirm it.
-        if bug_reason and not result.all_passed:
+        # A source bug requires real test execution: collection must have succeeded
+        # and at least one test must have run and failed.  A collection error or
+        # timeout (both set collected=False) means no test assertions were
+        # evaluated, so we cannot conclude anything about the source.
+        if bug_reason and result.collected and not result.all_passed:
             on_event("bug", i, bug_reason)
             return LoopResult(tests, result, i, "bug_found",
                               llm.input_tokens, llm.output_tokens, bug_reason)
