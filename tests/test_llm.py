@@ -193,4 +193,5 @@ def test_mock_mode_returns_default_when_queue_empty(monkeypatch):
     llm.model = DEFAULT_MODEL
     llm.input_tokens = 0
     llm.output_tokens = 0
-    assert llm.complete("s", "u") == "import target\n"
+    # _strip_fences strips trailing whitespace, so the fallback arrives without \n
+    assert llm.complete("s", "u") == "import target"

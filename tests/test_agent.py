@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 import testloop.llm as llm_module
-from testloop.agent import LoopResult, _extract_bug, generate_tests
+from testloop.agent import LoopResult, _extract_bug, _suite_score, generate_tests
 from testloop.llm import LLM
 from testloop.runner import RunResult
 
@@ -205,6 +205,9 @@ INIT_FAIL = RunResult(passed=24, failed=4, errors=0, collected=True, coverage=70
 REGRESSED = RunResult(passed=14, failed=0, errors=0, collected=True, coverage=90.0)
 # REPAIRED: model fixed the 4 failing tests; full suite of 28 now passes.
 REPAIRED  = RunResult(passed=28, failed=0, errors=0, collected=True, coverage=90.0)
+# COLL_ERR_COLLECTED: pytest wrote tests="1" errors="1" — collection error where
+# collected=True but no test actually executed.  Must NOT trigger regression guard.
+COLL_ERR_COLLECTED = RunResult(passed=0, failed=0, errors=1, collected=True, timed_out=False)
 
 
 def test_regression_not_treated_as_success():
@@ -254,6 +257,231 @@ def test_regression_resets_on_non_regressing_iteration():
                side_effect=[INIT_FAIL, REGRESSED, REPAIRED]):
         loop = generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=5)
     assert loop.outcome == "success"
+
+
+def test_collection_error_with_collected_true_does_not_trigger_regression():
+    """A collection error where pytest wrote collected=True must not fire the
+    regression guard.
+
+    pytest sometimes records a collection error as a test item (tests='1'
+    errors='1'), yielding collected=True but passed=0, failed=0.  The result
+    has total=1, which is far below any previous test count, but this is an
+    import failure — NOT the model deleting tests.  The loop must continue
+    without a regression event.
+    """
+    events: list[tuple[str, str]] = []
+    llm = _llm([STUB_TESTS, STUB_TESTS, STUB_TESTS])
+    # iter 1: 28 tests; iter 2: collection error (collected=True); iter 3: repair OK
+    with patch("testloop.agent.run_tests",
+               side_effect=[INIT_FAIL, COLL_ERR_COLLECTED, REPAIRED]):
+        loop = generate_tests(
+            SOURCE, llm,
+            coverage_target=80.0, max_iterations=5,
+            on_event=lambda kind, i, msg: events.append((kind, msg)),
+        )
+    # Collection error must not produce a "regress" event.
+    regress_events = [msg for kind, msg in events if kind == "regress"]
+    assert regress_events == [], f"unexpected regression events: {regress_events}"
+    # The loop should recover and succeed at iter 3.
+    assert loop.outcome == "success"
+    assert loop.iterations == 3
+
+
+def test_collection_error_preserves_prev_test_count():
+    """After a collection error (collected=True), prev_test_count is unchanged,
+    so a genuine regression on the following iteration is still detected."""
+    events: list[tuple[str, str]] = []
+    llm = _llm([STUB_TESTS, STUB_TESTS, STUB_TESTS, STUB_TESTS])
+    # iter 1: 28 tests; iter 2: collection error; iter 3: 14 tests (regression)
+    with patch("testloop.agent.run_tests",
+               side_effect=[INIT_FAIL, COLL_ERR_COLLECTED, REGRESSED, REPAIRED]):
+        loop = generate_tests(
+            SOURCE, llm,
+            coverage_target=80.0, max_iterations=5,
+            on_event=lambda kind, i, msg: events.append((kind, msg)),
+        )
+    # A regression at iter 3 (14 < 28) must still be detected.
+    regress_events = [msg for kind, msg in events if kind == "regress"]
+    assert len(regress_events) == 1
+    assert loop.outcome == "success"  # regression reverted; iter 4 succeeds
+
+
+# ─── Best-suite tracking ──────────────────────────────────────────────────────
+
+# Sentinel: a genuinely good run — high coverage, many passing tests.
+GOOD_RUN = RunResult(passed=40, failed=3, errors=0, collected=True, coverage=85.3)
+
+
+def test_incomplete_returns_best_suite_not_last():
+    """INCOMPLETE must report the best iteration, not the final broken one.
+
+    Scenario: iter 1 fails; iter 2 has 40/3/85.3%; iter 3 hits a collection
+    error.  The loop exhausts max_iterations and exits INCOMPLETE.  The result
+    must reflect iter 2, not iter 3.
+    """
+    llm = _llm([STUB_TESTS, STUB_TESTS, STUB_TESTS])
+    with patch("testloop.agent.run_tests",
+               side_effect=[FAILING, GOOD_RUN, COLL_ERR_COLLECTED]):
+        loop = generate_tests(SOURCE, llm, coverage_target=90.0, max_iterations=3)
+    assert loop.outcome == "incomplete"
+    assert loop.result.passed == 40
+    assert loop.result.failed == 3
+    assert loop.result.coverage == 85.3
+    # Tests written to disk must also be from the best iteration.
+    # (_strip_fences strips trailing whitespace, so compare without it.)
+    assert loop.tests == STUB_TESTS.strip()
+
+
+def test_best_suite_is_updated_when_later_iteration_improves():
+    """If a later non-regressing iteration scores higher it becomes the new best."""
+    better = RunResult(passed=50, failed=0, errors=0, collected=True, coverage=92.0)
+    llm = _llm([STUB_TESTS, STUB_TESTS, STUB_TESTS])
+    with patch("testloop.agent.run_tests",
+               side_effect=[GOOD_RUN, better, COLL_ERR_COLLECTED]):
+        loop = generate_tests(SOURCE, llm, coverage_target=95.0, max_iterations=3)
+    assert loop.outcome == "incomplete"
+    assert loop.result.coverage == 92.0
+    assert loop.result.passed == 50
+
+
+def test_incomplete_all_collection_errors_returns_last_tests():
+    """When every iteration has a collection error, fall back to the last tests."""
+    events: list[tuple[str, str]] = []
+    llm = _llm([STUB_TESTS, STUB_TESTS])
+    with patch("testloop.agent.run_tests", return_value=COLLECTION_ERR):
+        loop = generate_tests(
+            SOURCE, llm, coverage_target=80.0, max_iterations=2,
+            on_event=lambda kind, i, msg: events.append((kind, msg)),
+        )
+    # No crash; outcome is incomplete with last-run values as fallback.
+    assert loop.outcome == "incomplete"
+    # Every observe event should say "collection error".
+    observe_events = [msg for kind, msg in events if kind == "observe"]
+    assert all("collection error" in msg for msg in observe_events)
+
+
+def test_regressed_returns_best_suite():
+    """Two consecutive regressions return the best-seen suite, not prev."""
+    llm = _llm([STUB_TESTS, STUB_TESTS, STUB_TESTS])
+    # iter 1: INIT_FAIL (70%), iter 2: REGRESSED (guard fires), iter 3: REGRESSED again
+    with patch("testloop.agent.run_tests",
+               side_effect=[INIT_FAIL, REGRESSED, REGRESSED]):
+        loop = generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=5)
+    assert loop.outcome == "regressed"
+    # Best was INIT_FAIL (iter 1); REGRESSED iterations never update best.
+    assert loop.result.passed == 24
+    assert loop.result.coverage == 70.0
+
+
+# ─── _suite_score — unit tests ────────────────────────────────────────────────
+
+def test_suite_score_no_collection_error_beats_collection_error():
+    good  = RunResult(passed=1, failed=0, errors=0, collected=True, coverage=50.0)
+    bad   = RunResult(passed=0, failed=0, errors=1, collected=True, coverage=0.0)
+    assert _suite_score(good) > _suite_score(bad)
+
+
+def test_suite_score_higher_coverage_wins():
+    low  = RunResult(passed=10, failed=0, errors=0, collected=True, coverage=60.0)
+    high = RunResult(passed=5,  failed=0, errors=0, collected=True, coverage=80.0)
+    assert _suite_score(high) > _suite_score(low)
+
+
+def test_suite_score_more_passing_breaks_coverage_tie():
+    a = RunResult(passed=10, failed=2, errors=0, collected=True, coverage=80.0)
+    b = RunResult(passed=15, failed=0, errors=0, collected=True, coverage=80.0)
+    assert _suite_score(b) > _suite_score(a)
+
+
+def test_suite_score_fewer_failures_breaks_pass_tie():
+    a = RunResult(passed=10, failed=5, errors=0, collected=True, coverage=80.0)
+    b = RunResult(passed=10, failed=2, errors=0, collected=True, coverage=80.0)
+    assert _suite_score(b) > _suite_score(a)
+
+
+# ─── Fence stripping ──────────────────────────────────────────────────────────
+
+def test_fenced_repair_response_is_stripped():
+    """A repair response wrapped in ```python ... ``` fences must produce
+    unfenced tests; otherwise pytest gets a SyntaxError: invalid syntax on
+    line 1 of the generated file."""
+    fenced = "```python\nimport target\ndef test_foo():\n    assert True\n```"
+    llm = _llm([STUB_TESTS, fenced])
+    with patch("testloop.agent.run_tests", side_effect=[FAILING, PASSING]):
+        loop = generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=5)
+    assert not loop.tests.startswith("```"), (
+        "fence not stripped from repair response — tests would cause SyntaxError"
+    )
+    assert loop.outcome == "success"
+
+
+# ─── Collection error output visibility ───────────────────────────────────────
+
+def test_collection_error_emits_output_event_when_output_present():
+    """An "output" event is fired when pytest produced non-empty output."""
+    err_with_output = RunResult(
+        passed=0, failed=0, errors=1, collected=False,
+        output="ImportError: No module named 'natsort.__main__'",
+    )
+    events: list[tuple[str, str]] = []
+    llm = _llm([STUB_TESTS, STUB_TESTS])
+    with patch("testloop.agent.run_tests", side_effect=[err_with_output, PASSING]):
+        generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=5,
+                       on_event=lambda kind, i, msg: events.append((kind, msg)))
+    output_events = [(kind, msg) for kind, msg in events if kind == "output"]
+    assert output_events, "expected at least one 'output' event"
+    assert "ImportError" in output_events[0][1]
+
+
+def test_collection_error_no_output_event_when_empty():
+    """No "output" event is emitted when pytest output is empty."""
+    err_no_output = RunResult(passed=0, failed=0, errors=1, collected=False, output="")
+    events: list[tuple[str, str]] = []
+    llm = _llm([STUB_TESTS, STUB_TESTS])
+    with patch("testloop.agent.run_tests", side_effect=[err_no_output, PASSING]):
+        generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=5,
+                       on_event=lambda kind, i, msg: events.append((kind, msg)))
+    output_events = [kind for kind, _ in events if kind == "output"]
+    assert output_events == []
+
+
+# ─── 0%-coverage bail-out ─────────────────────────────────────────────────────
+
+def test_zero_coverage_bail_out_after_two_passing_zero_cov_runs():
+    """Two consecutive runs where tests pass but coverage is 0% must exit early
+    as INCOMPLETE.  This prevents burning the whole iteration budget on modules
+    that can never be instrumented (e.g. C extensions)."""
+    zero_cov = RunResult(passed=5, failed=0, errors=0, collected=True, coverage=0.0)
+    llm = _llm([STUB_TESTS] * 5)
+    with patch("testloop.agent.run_tests", return_value=zero_cov):
+        loop = generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=5)
+    assert loop.outcome == "incomplete"
+    assert loop.iterations == 2  # bailed out after 2nd zero-cov passing run
+
+
+def test_zero_coverage_does_not_bail_when_tests_failing():
+    """0% coverage with failing tests is the normal early-iteration state.
+    The loop must continue so the model can fix the failures."""
+    zero_cov_fail = RunResult(passed=0, failed=3, errors=0, collected=True, coverage=0.0)
+    llm = _llm([STUB_TESTS, STUB_TESTS])
+    with patch("testloop.agent.run_tests", side_effect=[zero_cov_fail, PASSING]):
+        loop = generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=5)
+    assert loop.outcome == "success"
+
+
+def test_zero_coverage_streak_resets_on_nonzero_coverage():
+    """A non-zero coverage run resets the streak so a later zero-cov pair
+    is required to trigger the bail-out again."""
+    zero_cov = RunResult(passed=3, failed=0, errors=0, collected=True, coverage=0.0)
+    some_cov = RunResult(passed=3, failed=0, errors=0, collected=True, coverage=50.0)
+    llm = _llm([STUB_TESTS] * 5)
+    # iter 1: 0% (streak=1), iter 2: 50% (streak resets), iter 3: 0% (streak=1),
+    # iter 4: 0% (streak=2 → bail out)
+    with patch("testloop.agent.run_tests",
+               side_effect=[zero_cov, some_cov, zero_cov, zero_cov]):
+        loop = generate_tests(SOURCE, llm, coverage_target=80.0, max_iterations=5)
+    assert loop.outcome == "incomplete"
+    assert loop.iterations == 4
 
 
 # ─── Outcome: incomplete ──────────────────────────────────────────────────────

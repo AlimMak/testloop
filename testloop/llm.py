@@ -33,7 +33,8 @@ class LLM:
 
     def complete(self, system: str, user: str) -> str:
         if self.mock:
-            return _MOCK.pop(0) if _MOCK else "import target\n"
+            text = _MOCK.pop(0) if _MOCK else "import target\n"
+            return _strip_fences(text)
         resp = self._client.messages.create(
             model=self.model,
             max_tokens=4096,

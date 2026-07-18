@@ -8,6 +8,7 @@ import pytest
 
 from testloop.discovery import (
     _dotted,
+    discover_all,
     find_import_root,
     _is_reexport_only,
     _is_skip_dir,
@@ -40,6 +41,7 @@ def test_is_skip_dir(name, expected):
     ("test_foo.py",      True),
     ("conftest.py",      True),
     ("setup.py",         True),
+    ("__main__.py",      True),   # CLI entry point — not unit-testable
     ("utils.py",         False),
     ("__init__.py",      False),
     ("models.py",        False),
@@ -81,6 +83,48 @@ def test_reexport_dunder_assignments(tmp_path):
     p = _write(tmp_path, "__init__.py",
                '__all__ = ["helper"]\n__version__ = "1.0.0"\n')
     assert _is_reexport_only(p) is True
+
+
+def test_reexport_try_except_import_guard(tmp_path):
+    """try/except ImportError guards (e.g. optional C-extension imports) must be
+    treated as re-export-only — they contain no FunctionDef or ClassDef.
+
+    This is the pattern used in natsort's __init__.py:
+        try:
+            from natsort._natsort import natsorted
+        except ImportError:
+            from natsort.natsort import natsorted
+    """
+    p = _write(tmp_path, "__init__.py",
+               "try:\n"
+               "    from ._fast import helper\n"
+               "except ImportError:\n"
+               "    from ._slow import helper\n")
+    assert _is_reexport_only(p) is True
+
+
+def test_reexport_globals_update_call(tmp_path):
+    """A module-level globals().update({...}) call with no function definitions
+    must be treated as re-export-only.
+
+    natsort's __init__.py also contains:
+        globals().update({'natsorted': natsorted, ...})
+    which is an Expr node with a Call — no FunctionDef present.
+    """
+    p = _write(tmp_path, "__init__.py",
+               "from .core import natsorted\n"
+               "globals().update({'natsorted': natsorted})\n")
+    assert _is_reexport_only(p) is True
+
+
+def test_reexport_try_except_with_function_inside_is_not_reexport(tmp_path):
+    """A try block that contains a function definition is NOT re-export-only."""
+    p = _write(tmp_path, "__init__.py",
+               "try:\n"
+               "    def _init(): pass\n"
+               "except Exception:\n"
+               "    pass\n")
+    assert _is_reexport_only(p) is False
 
 
 def test_reexport_with_real_logic(tmp_path):
@@ -207,9 +251,9 @@ def test_discover_includes_init_with_logic(tmp_path):
 def test_discover_respects_max_files_via_slice(tmp_path):
     """discover_modules returns all; callers apply max-files via slicing."""
     _make_pkg(tmp_path, {
-        "a.py": "x=1\n",
-        "b.py": "x=2\n",
-        "c.py": "x=3\n",
+        "a.py": "def fa(): pass\n",
+        "b.py": "def fb(): pass\n",
+        "c.py": "def fc(): pass\n",
     })
     all_modules = discover_modules(tmp_path)
     assert len(all_modules[:2]) == 2
@@ -225,6 +269,70 @@ def test_discover_returns_absolute_paths(tmp_path):
 
 def test_discover_empty_dir(tmp_path):
     assert discover_modules(tmp_path) == []
+
+
+def test_discover_skips_main_module(tmp_path):
+    """__main__.py is a CLI entry point and must not appear in testable modules."""
+    _make_pkg(tmp_path, {
+        "mypkg/__init__.py": "from .utils import helper\n",
+        "mypkg/__main__.py": "from mypkg.cli import main\nif __name__ == '__main__': main()\n",
+        "mypkg/utils.py": "def helper(): pass\n",
+    })
+    result = discover_modules(tmp_path)
+    names = [d for d, _ in result]
+    assert "mypkg.utils" in names
+    assert "mypkg.__main__" not in names
+
+
+def test_discover_skips_reexport_only_non_init(tmp_path):
+    """Any .py file (not just __init__.py) that is re-export-only is skipped."""
+    _make_pkg(tmp_path, {
+        "pkg/__init__.py": "from .core import func\n",  # re-export only → skip
+        "pkg/compat.py":   "from .core import func\n",  # re-export only → skip
+        "pkg/core.py":     "def func(): pass\n",        # has logic → keep
+    })
+    result = discover_modules(tmp_path)
+    names = [d for d, _ in result]
+    assert "pkg.core" in names
+    assert "pkg.__init__" not in names
+    assert "pkg.compat" not in names
+
+
+# ─── discover_all ─────────────────────────────────────────────────────────────
+
+def test_discover_all_splits_testable_and_skipped(tmp_path):
+    _make_pkg(tmp_path, {
+        "pkg/__init__.py": "from .core import func\n",  # re-export only
+        "pkg/core.py":     "def func(): pass\n",
+    })
+    testable, skipped = discover_all(tmp_path)
+    testable_names = [d for d, _ in testable]
+    skipped_names  = [d for d, _ in skipped]
+    assert "pkg.core" in testable_names
+    assert "pkg.__init__" in skipped_names
+    assert "pkg.__init__" not in testable_names
+
+
+def test_discover_all_main_not_in_skipped(tmp_path):
+    """__main__.py is silently excluded — it appears in neither list."""
+    _make_pkg(tmp_path, {
+        "pkg/__main__.py": "import sys\n",
+        "pkg/core.py":     "def func(): pass\n",
+    })
+    testable, skipped = discover_all(tmp_path)
+    all_names = [d for d, _ in testable] + [d for d, _ in skipped]
+    assert "pkg.__main__" not in all_names
+    assert "pkg.core" in [d for d, _ in testable]
+
+
+def test_discover_all_empty_init_is_skipped(tmp_path):
+    _make_pkg(tmp_path, {
+        "pkg/__init__.py": "",
+        "pkg/utils.py": "def f(): pass\n",
+    })
+    testable, skipped = discover_all(tmp_path)
+    skipped_names = [d for d, _ in skipped]
+    assert "pkg.__init__" in skipped_names
 
 
 # ─── collect_package_files ────────────────────────────────────────────────────

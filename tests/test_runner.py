@@ -234,6 +234,20 @@ def test_total_property(passed, failed, errors, expected):
         False,
         id="collected_and_timed_out",
     ),
+    # pytest sometimes writes tests="1" errors="1" for a collection-error item,
+    # giving collected=True but passed=0 and failed=0.  This must still be
+    # treated as a collection error, not a run with one errored test.
+    pytest.param(
+        dict(passed=0, failed=0, errors=1, collected=True, timed_out=False),
+        True,
+        id="collected_true_but_only_errors",
+    ),
+    # A run with real test results plus an error is NOT a collection error.
+    pytest.param(
+        dict(passed=3, failed=0, errors=1, collected=True, timed_out=False),
+        False,
+        id="real_tests_plus_error",
+    ),
 ])
 def test_collection_error_property(kwargs, expected):
     result = RunResult(**kwargs)

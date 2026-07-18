@@ -16,9 +16,12 @@ _SKIP_DIRS: frozenset[str] = frozenset({
     "node_modules", "dist", "build", ".eggs", ".pytest_cache",
 })
 
-# File patterns that are skipped during module discovery (but not when
-# collecting the full package snapshot for the sandbox).
-_SKIP_FILE_PATTERNS: tuple[str, ...] = ("test_*.py", "conftest.py", "setup.py")
+# File patterns that are silently excluded from module discovery (not reported
+# in the summary table).  Test files, config shims, and CLI entry points are
+# not unit-testable and produce no useful generated tests.
+_SKIP_FILE_PATTERNS: tuple[str, ...] = (
+    "test_*.py", "conftest.py", "setup.py", "__main__.py",
+)
 
 
 def _is_hidden(name: str) -> bool:
@@ -34,17 +37,23 @@ def _is_skip_file(name: str) -> bool:
 
 
 def _is_reexport_only(path: Path) -> bool:
-    """Return True when __init__.py is empty or only contains re-export boilerplate.
+    """Return True when the module contains no testable logic.
 
-    An __init__.py is considered a re-export-only file when every statement is
-    one of:
-    - an import or from-import (re-exporting names from sub-modules)
-    - a bare string literal (docstring / __all__ prose)
-    - an assignment whose targets are all ``__dunder__`` names
-      (e.g. ``__all__ = [...]``, ``__version__ = "1.0"``)
+    A module is considered re-export-only when its AST has no function or
+    class definitions at *any* nesting level.  This covers the common cases:
 
-    Such files contain no testable logic of their own and are skipped by
-    :func:`discover_modules`.
+    - empty ``__init__.py``
+    - ``__init__.py`` with only imports and ``__all__`` / dunder assignments
+    - ``try/except ImportError`` guard blocks (e.g. optional C-extension imports)
+    - ``globals().update(...)`` calls and other module-level expressions
+
+    Checking the full walk rather than just top-level statements means
+    ``try/except`` bodies are inspected correctly — a package that wraps its
+    imports in a ``try`` block (e.g. natsort) is still classified as
+    re-export-only unless a function or class definition appears somewhere.
+
+    Unparseable (syntax-error) files return ``False`` so the error surfaces
+    naturally when the generated tests attempt to import the module.
     """
     try:
         src = path.read_text(encoding="utf-8").strip()
@@ -56,17 +65,9 @@ def _is_reexport_only(path: Path) -> bool:
         tree = ast.parse(src)
     except SyntaxError:
         return False  # unparseable — let the test suite catch the syntax error
-    for stmt in tree.body:
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            continue
-        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
-            continue  # bare string (docstring or __all__ prose)
-        if isinstance(stmt, ast.Assign) and all(
-            isinstance(t, ast.Name) and t.id.startswith("__") and t.id.endswith("__")
-            for t in stmt.targets
-        ):
-            continue  # __all__ = [...], __version__ = "1.0", etc.
-        return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return False
     return True
 
 
@@ -78,28 +79,57 @@ def _dotted(root: Path, path: Path) -> str:
     return ".".join(parts)
 
 
-def discover_modules(root: Path) -> list[tuple[str, Path]]:
-    """Return ``(dotted_module_name, absolute_path)`` for testable modules under *root*.
+def discover_all(
+    root: Path,
+) -> tuple[list[tuple[str, Path]], list[tuple[str, Path]]]:
+    """Return ``(testable, skipped)`` module lists for *root*.
 
-    Skipped:
-    - ``test_*.py``, ``conftest.py``, ``setup.py``
-    - ``__pycache__``, ``.venv``, and any directory whose name starts with ``.``
-    - ``__init__.py`` that is empty or only re-exports (no testable logic)
+    *testable* — modules with real logic worth generating tests for.
+    *skipped*  — modules that exist but are trivially untestable (re-export-only
+                 files, empty ``__init__.py``, etc.).
 
-    Results are sorted by dotted name for deterministic ordering.
+    Files matching :data:`_SKIP_FILE_PATTERNS` (test files, ``__main__.py``, …)
+    are excluded entirely and appear in neither list.
+
+    A module is considered *trivial* (placed in *skipped*) when its top-level
+    body contains only import statements, ``__all__`` / ``__version__``
+    assignments, and bare string literals — no function or class definitions.
+    This catches pure re-export ``__init__.py`` files as well as any other
+    module that has no logic of its own.
     """
     root = root.resolve()
-    results: list[tuple[str, Path]] = []
+    testable: list[tuple[str, Path]] = []
+    skipped: list[tuple[str, Path]] = []
     for py_file in sorted(root.rglob("*.py")):
         rel = py_file.relative_to(root)
         if any(_is_skip_dir(part) for part in rel.parts[:-1]):
             continue
         if _is_skip_file(py_file.name):
             continue
-        if py_file.name == "__init__.py" and _is_reexport_only(py_file):
-            continue
-        results.append((_dotted(root, py_file), py_file))
-    return results
+        dotted = _dotted(root, py_file)
+        if _is_reexport_only(py_file):
+            skipped.append((dotted, py_file))
+        else:
+            testable.append((dotted, py_file))
+    return testable, skipped
+
+
+def discover_modules(root: Path) -> list[tuple[str, Path]]:
+    """Return ``(dotted_module_name, absolute_path)`` for testable modules under *root*.
+
+    Silently excluded:
+    - ``test_*.py``, ``conftest.py``, ``setup.py``, ``__main__.py``
+    - ``__pycache__``, ``.venv``, and any directory whose name starts with ``.``
+    - any ``.py`` file whose top-level body is re-export-only (imports, ``__all__``,
+      constants only — no function or class definitions)
+
+    Results are sorted by dotted name for deterministic ordering.
+
+    For directory-mode CLI use, prefer :func:`discover_all` which also returns
+    the list of skipped (trivial) modules for table reporting.
+    """
+    testable, _ = discover_all(root)
+    return testable
 
 
 def find_import_root(path: Path) -> Path:

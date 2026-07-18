@@ -16,6 +16,12 @@ from .llm import LLM
 
 
 def _print_event(kind: str, i: int, msg: str) -> None:
+    if kind == "output":
+        # Print the actual pytest / ImportError output indented, last 20 lines.
+        lines = msg.strip().splitlines()
+        for line in lines[-20:]:
+            print(f"       {line}")
+        return
     tag = {"act": "->", "observe": "..", "done": "**", "bug": "!!", "regress": "!!"}.get(kind, "  ")
     print(f"  [iter {i}] {tag} {msg}")
 
@@ -34,6 +40,7 @@ _STATUS_LABELS = {
     "bug_found":  "BUG FOUND",
     "incomplete": "INCOMPLETE",
     "regressed":  "REGRESSED",
+    "skipped":    "SKIPPED",
     "error":      "ERROR",
 }
 
@@ -86,7 +93,8 @@ def _print_summary(
             cov_values.append(r["coverage"])
 
     print(sep)
-    n = len(rows)
+    # Skipped modules are shown in the table but not counted in the pass/fail totals.
+    n = sum(1 for r in rows if r["status"] != "skipped")
     avg_cov = f"{sum(cov_values) / len(cov_values):.1f}% avg" if cov_values else "-"
     print(_fmt_row("TOTAL", f"{pass_count}/{n} pass", str(total_tests), avg_cov,
                    str(total_iters), str(total_tokens)))
@@ -99,7 +107,7 @@ def _print_summary(
 # ─── Directory mode ───────────────────────────────────────────────────────────
 
 def _run_directory(root: Path, args: argparse.Namespace) -> int:
-    from .discovery import collect_package_files, discover_modules, find_import_root
+    from .discovery import collect_package_files, discover_all, find_import_root
 
     root = root.resolve()
 
@@ -111,13 +119,12 @@ def _run_directory(root: Path, args: argparse.Namespace) -> int:
     # imports inside the package to fail at collection time.
     import_root = find_import_root(root)
 
-    # Discover all testable modules from the import root, then filter to those
-    # that live under the directory the user actually requested.
-    all_modules = [
-        (d, p)
-        for d, p in discover_modules(import_root)
-        if p.is_relative_to(root)
-    ]
+    # Discover testable and trivially-skipped modules from the import root,
+    # then filter each list to modules that live under the requested directory.
+    all_testable, all_trivial = discover_all(import_root)
+    all_modules = [(d, p) for d, p in all_testable if p.is_relative_to(root)]
+    trivial_modules = [(d, p) for d, p in all_trivial if p.is_relative_to(root)]
+
     if not all_modules:
         print(f"error: no testable modules found under {root}", file=sys.stderr)
         return 2
@@ -130,6 +137,8 @@ def _run_directory(root: Path, args: argparse.Namespace) -> int:
         f"testloop: {root}  ({len(modules)} module(s), "
         f"target {args.coverage}% cov, max {args.max_iters} iters)"
     )
+    if trivial_modules:
+        print(f"  ({len(trivial_modules)} trivial module(s) skipped — re-export only)")
     if skipped:
         print(f"  (--max-files {max_files}: {skipped} module(s) not scheduled)")
 
@@ -208,10 +217,22 @@ def _run_directory(root: Path, args: argparse.Namespace) -> int:
             budget_hit = True
             break
 
+    # Append SKIPPED rows for trivial (re-export-only) modules so they appear
+    # in the summary table rather than disappearing silently.
+    for dotted, _ in trivial_modules:
+        rows.append({
+            "module":   dotted,
+            "status":   "skipped",
+            "tests":    None,
+            "coverage": None,
+            "iters":    None,
+            "tokens":   None,
+        })
+
     _print_summary(rows, budget_hit=budget_hit, skipped=skipped)
 
     any_bug  = any(r["status"] == "bug_found"  for r in rows)
-    all_ok   = all(r["status"] == "success"    for r in rows)
+    all_ok   = all(r["status"] in ("success", "skipped") for r in rows)
     if any_bug:
         return 2
     if all_ok and not budget_hit:

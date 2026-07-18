@@ -66,8 +66,19 @@ class RunResult:
         all.  The loop must not treat 0 passed / 0 failed as ordinary output —
         the import statements in the test file are wrong and must be repaired
         before any test logic can be evaluated.
+
+        Two forms are detected:
+        - ``collected=False``: pytest aborted before writing a JUnit report, or
+          wrote ``tests="0" errors="1"`` (collection failed for every item).
+        - ``collected=True`` but no test actually executed: pytest wrote
+          ``tests="1" errors="1"`` (one collection-error item recorded as a
+          test), giving ``passed=0, failed=0`` with ``errors>0``.
         """
-        return not self.collected and not self.timed_out
+        if self.timed_out:
+            return False
+        return not self.collected or (
+            self.passed == 0 and self.failed == 0 and self.errors > 0
+        )
 
 
 def _pytest_args(module_dotted: str) -> list[str]:
