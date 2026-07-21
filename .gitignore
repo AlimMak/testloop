@@ -5,3 +5,6 @@ billing.py
 __pycache__/
 *.egg-info/
 scratch/
+
+# generated test output
+testloop/test_*.py
