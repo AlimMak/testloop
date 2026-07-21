@@ -16,5 +16,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install pytest pytest-cov anthropic
+      - run: pip install -e .
       - run: pytest -v

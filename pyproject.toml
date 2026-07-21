@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "testloop"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic",
+    "pytest",
+    "pytest-cov",
+]
+
+[project.scripts]
+testloop = "testloop.cli:main"
+
+[tool.setuptools.packages.find]
+# Only install the testloop package — not tests/, scratch/, or loose scripts.
+include = ["testloop*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

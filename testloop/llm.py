@@ -70,23 +70,28 @@ class LLM:
             text = _MOCK.pop(0) if _MOCK else "import target\n"
             return _strip_fences(text)
         effective_max = max_tokens if max_tokens is not None else self.max_tokens
-        resp = self._client.messages.create(
+        # Use streaming so the Anthropic API accepts large max_tokens values
+        # without hitting the 10-minute non-streaming ceiling.  get_final_message()
+        # returns the fully-assembled Message, so every field downstream touches
+        # (content, stop_reason, usage) is identical to the non-streaming path.
+        with self._client.messages.stream(
             model=self.model,
             max_tokens=effective_max,
             system=system,
             messages=[{"role": "user", "content": user}],
-        )
-        self.input_tokens += resp.usage.input_tokens
-        self.output_tokens += resp.usage.output_tokens
+        ) as stream:
+            final = stream.get_final_message()
+        self.input_tokens += final.usage.input_tokens
+        self.output_tokens += final.usage.output_tokens
         # The response may contain non-text blocks (e.g. a thinking block) before
         # the text, so join every text block rather than assuming content[0].
         text = "\n".join(
-            b.text for b in resp.content if getattr(b, "type", None) == "text"
+            b.text for b in final.content if getattr(b, "type", None) == "text"
         )
         # Incomplete responses must not silently corrupt the generated file.
-        if resp.stop_reason == "max_tokens":
+        if final.stop_reason == "max_tokens":
             raise TruncatedResponseError(partial=text,
-                                         output_tokens=resp.usage.output_tokens)
+                                         output_tokens=final.usage.output_tokens)
         return _strip_fences(text)
 
 

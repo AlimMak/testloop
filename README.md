@@ -18,19 +18,26 @@ counts, exact uncovered line numbers, timeouts) is fed back into the repair
 prompt, so each iteration is grounded in what actually happened rather than in
 the model guessing.
 
+## Install
+
+```bash
+pip install -e .          # or: pipx install -e .
+```
+
 ## Run it
 
 ```bash
-pip install pytest pytest-cov anthropic
 export ANTHROPIC_API_KEY=sk-...
-python -m testloop examples/example_target.py --coverage 90 --max-iters 5
+testloop examples/example_target.py --coverage 90 --max-iters 5
 ```
 
 Offline demo with no API key (uses scripted responses):
 
 ```bash
-python -m testloop examples/example_target.py --mock
+testloop examples/example_target.py --mock
 ```
+
+`python -m testloop` also works if you prefer.
 
 ## Architecture
 
@@ -68,7 +75,7 @@ Build the image once:
 
 ```bash
 docker build -t testloop-sandbox .
-python -m testloop billing.py --docker --coverage 95
+testloop billing.py --docker --coverage 95
 ```
 
 Where it still stops: the container runs as root and shares the host kernel, so
